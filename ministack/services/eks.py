@@ -12,11 +12,13 @@ Supports:
   Nodegroups: CreateNodegroup, DescribeNodegroup, ListNodegroups, DeleteNodegroup
   IdP configs: AssociateIdentityProviderConfig, DescribeIdentityProviderConfig,
               DisassociateIdentityProviderConfig, ListIdentityProviderConfigs
+  Authentication: AWS IAM exec tokens through a k3s TokenReview webhook
   Tags:       TagResource, UntagResource, ListTagsForResource
 """
 
 import base64
 import copy
+import datetime as dt
 import importlib
 import json
 import logging
@@ -29,14 +31,29 @@ import urllib.parse
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
+from ministack.core.iam_evaluator import (
+    AmbiguousAccessKeyError,
+    CredentialResolutionError,
+    find_iam_access_key_account,
+    resolve_caller_identity,
+    resolve_credential,
+)
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
+    _account_from_sts_session,
     apply_image_prefix,
     get_account_id,
     get_region,
     new_uuid,
+)
+from ministack.core.router import extract_access_key_id
+from ministack.core.sigv4 import (
+    build_canonical_request,
+    build_string_to_sign,
+    calculate_signature,
+    signatures_match,
 )
 
 logger = logging.getLogger("eks")
@@ -75,6 +92,17 @@ _port_counter_lock = threading.Lock()
 _port_counter = [EKS_BASE_PORT]
 _oidc_keypair_lock = threading.Lock()
 _oidc_keypair = None                  # (private_key, jwk_dict, kid)
+
+
+def _cluster_endpoint(port):
+    """The endpoint DescribeCluster advertises for the kube-apiserver — the
+    host-published port ``https://{MINISTACK_HOST}:{port}``. The k3s container
+    publishes 6443 to this host port (``ports={"6443/tcp": port}``), so it is
+    reachable from the host (``aws eks update-kubeconfig`` + kubectl) and from
+    containers that can route to ``MINISTACK_HOST``. The same value is used on
+    every path (create, restart, restore).
+    """
+    return f"https://{_MINISTACK_HOST}:{port}"
 
 
 def _ministack_issuer_base():
@@ -236,7 +264,7 @@ def restore_state(data):
         c["_docker_id"] = None
         port = c.get("_port")
         if port:
-            c["endpoint"] = f"https://{_MINISTACK_HOST}:{port}"
+            c["endpoint"] = _cluster_endpoint(port)
 
 
 
@@ -324,17 +352,6 @@ def _get_ministack_network(client):
         return None
 
 
-def _cluster_endpoint(port):
-    """The endpoint DescribeCluster advertises for the kube-apiserver — the
-    host-published port ``https://{MINISTACK_HOST}:{port}``. The k3s container
-    publishes 6443 to this host port (``ports={"6443/tcp": port}``), so it is
-    reachable from the host (``aws eks update-kubeconfig`` + kubectl) and from
-    containers that can route to ``MINISTACK_HOST``. The same value is used on
-    every path (create, restart, restore).
-    """
-    return f"https://{_MINISTACK_HOST}:{port}"
-
-
 def _collect_oidc_state(cluster_name: str):
     """Return (apiserver_args, cfg_refs) for OIDC configs on a cluster.
 
@@ -402,6 +419,8 @@ def _k3s_run_kwargs(
         "--disable=traefik,metrics-server,servicelb",
         "--tls-san=0.0.0.0",
         "--https-listen-port=6443",
+        "--kube-apiserver-arg=authentication-token-webhook-config-file=/etc/rancher/k3s/eks-auth-webhook.yaml",
+        "--kube-apiserver-arg=authentication-token-webhook-cache-ttl=5m",
     ]
     if oidc_args:
         command.extend(oidc_args)
@@ -438,6 +457,55 @@ def _k3s_run_kwargs(
     run_kwargs["extra_hosts"] = {"host.docker.internal": "host-gateway"}
 
     return run_kwargs
+
+
+def _k3s_gateway_host(client, ms_network):
+    """Return the address a k3s container can use to call MiniStack."""
+    if ms_network and client is not None:
+        try:
+            self_container = client.containers.get(os.environ.get("HOSTNAME", ""))
+            nets = self_container.attrs["NetworkSettings"]["Networks"]
+            host = (nets.get(ms_network) or {}).get("IPAddress")
+            if host:
+                return host
+        except Exception:
+            pass
+    return "host.docker.internal"
+
+
+def _k3s_auth_webhook_config(client, ms_network, cluster_name, account_id=None, region=None):
+    """Build the kubeconfig consumed by the k3s token webhook authenticator.
+
+    The webhook endpoint is deliberately addressed through MiniStack's
+    container-network address rather than the host-published EKS port. This
+    works for both a shared Docker network and a host-run gateway.
+    """
+    from ministack.core import tls as _tls
+
+    host = _k3s_gateway_host(client, ms_network)
+    port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
+    scheme = "https" if _tls.use_ssl_enabled() else "http"
+    account_id = account_id or get_account_id()
+    region = region or get_region()
+    server = f"{scheme}://{host}:{port}/eks-auth/{account_id}/{region}/{cluster_name}"
+    return (
+        "apiVersion: v1\n"
+        "kind: Config\n"
+        "clusters:\n"
+        "- name: ministack-eks-auth\n"
+        "  cluster:\n"
+        f"    server: {server}\n"
+        "    insecure-skip-tls-verify: true\n"
+        "users:\n"
+        "- name: ministack-eks-auth\n"
+        "  user: {}\n"
+        "contexts:\n"
+        "- name: ministack-eks-auth\n"
+        "  context:\n"
+        "    cluster: ministack-eks-auth\n"
+        "    user: ministack-eks-auth\n"
+        "current-context: ministack-eks-auth\n"
+    ).encode()
 
 
 def _ecr_registry_hosts(cluster: dict) -> list[str]:
@@ -489,13 +557,16 @@ def _k3s_registries_yaml(client, ms_network: str | None, ecr_hosts: list[str]) -
     return ("\n".join(lines) + "\n").encode()
 
 
-def _start_k3s_container(client, run_kwargs: dict, registries_yaml: bytes | None):
+def _start_k3s_container(
+    client, run_kwargs: dict, registries_yaml: bytes | None,
+    auth_webhook_config: bytes | None = None,
+):
     """Start the k3s container, injecting registries.yaml before boot.
 
     k3s reads /etc/rancher/k3s/registries.yaml once at startup, so the file
     must exist before the entrypoint runs: create the container stopped,
     upload the file with put_archive, then start it."""
-    if not registries_yaml:
+    if not registries_yaml and not auth_webhook_config:
         return client.containers.run(**run_kwargs)
     import io
     import tarfile
@@ -511,13 +582,19 @@ def _start_k3s_container(client, run_kwargs: dict, registries_yaml: bytes | None
     try:
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tar:
-            info = tarfile.TarInfo("etc/rancher/k3s/registries.yaml")
-            info.size = len(registries_yaml)
-            info.mode = 0o644
-            tar.addfile(info, io.BytesIO(registries_yaml))
+            for filename, content in (
+                ("etc/rancher/k3s/registries.yaml", registries_yaml),
+                ("etc/rancher/k3s/eks-auth-webhook.yaml", auth_webhook_config),
+            ):
+                if not content:
+                    continue
+                info = tarfile.TarInfo(filename)
+                info.size = len(content)
+                info.mode = 0o644
+                tar.addfile(info, io.BytesIO(content))
         container.put_archive("/", buf.getvalue())
     except Exception as e:
-        logger.warning("EKS: could not inject ECR registries.yaml: %s", e)
+        logger.warning("EKS: could not inject k3s startup configuration: %s", e)
     container.start()
     return container
 
@@ -557,7 +634,7 @@ def _extract_ca_cert(container, timeout=30):
 # Clusters
 # ---------------------------------------------------------------------------
 
-def _create_cluster(body):
+def _create_cluster(body, creator_arn=None):
     name = body.get("name", "")
     if not name:
         return _error(400, "InvalidParameterException", "Cluster name is required.")
@@ -582,7 +659,7 @@ def _create_cluster(body):
 
     # Build cluster record immediately (status CREATING) and return fast.
     # k3s startup happens in background thread to avoid blocking the event loop.
-    endpoint = f"https://{_MINISTACK_HOST}:{port}"
+    endpoint = _cluster_endpoint(port)
     cluster = {
         "name": name,
         "arn": arn,
@@ -613,6 +690,7 @@ def _create_cluster(body):
         "tags": body.get("tags", {}),
         "encryptionConfig": body.get("encryptionConfig", []),
         "accessConfig": body.get("accessConfig", {}),
+        "_creator_arn": creator_arn,
         "_docker_id": None,
         "_port": port,
     }
@@ -621,7 +699,7 @@ def _create_cluster(body):
     if cluster["tags"]:
         _tags[arn] = dict(cluster["tags"])
 
-    region = get_region()
+    account_id, region = get_account_id(), get_region()
     oidc_args, _idp_cfg_refs = _collect_oidc_state(name)
     node_labels = _collect_node_labels(cluster)
 
@@ -644,7 +722,12 @@ def _create_cluster(body):
             )
 
             registries_yaml = _k3s_registries_yaml(client, ms_network, _ecr_registry_hosts(cluster))
-            container = _start_k3s_container(client, run_kwargs, registries_yaml)
+            auth_webhook_config = _k3s_auth_webhook_config(
+                client, ms_network, name, account_id, region
+            )
+            container = _start_k3s_container(
+                client, run_kwargs, registries_yaml, auth_webhook_config
+            )
             cluster["_docker_id"] = container.id
 
             cluster["endpoint"] = _cluster_endpoint(port)
@@ -655,7 +738,7 @@ def _create_cluster(body):
             cluster["status"] = "ACTIVE"
             cluster["certificateAuthority"]["data"] = base64.b64encode(b"MOCK-CA-CERTIFICATE").decode()
             # No container came up — advertise the host-published endpoint.
-            cluster["endpoint"] = f"https://{_MINISTACK_HOST}:{port}"
+            cluster["endpoint"] = _cluster_endpoint(port)
 
     threading.Thread(target=_bg_start, daemon=True, name=f"eks-{name}").start()
     return _json_resp(200, {"cluster": _sanitize(cluster)})
@@ -1143,7 +1226,13 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
             )
 
             registries_yaml = _k3s_registries_yaml(client, ms_network, _ecr_registry_hosts(cluster))
-            container = _start_k3s_container(client, run_kwargs, registries_yaml)
+            cluster_spec = parse_arn(cluster.get("arn", ""))
+            auth_webhook_config = _k3s_auth_webhook_config(
+                client, ms_network, cluster_name, cluster_spec.account_id, cluster_spec.region
+            )
+            container = _start_k3s_container(
+                client, run_kwargs, registries_yaml, auth_webhook_config
+            )
             cluster["_docker_id"] = container.id
 
             cluster["endpoint"] = _cluster_endpoint(cluster["_port"])
@@ -1153,7 +1242,7 @@ def _restart_k3s(cluster_name, oidc_args=None, idp_cfg_refs=None):
             logger.warning("EKS: failed to restart k3s for %s — falling back to mock: %s", cluster_name, e)
             cluster["certificateAuthority"]["data"] = base64.b64encode(b"MOCK-CA-CERTIFICATE").decode()
             # No container came up — advertise the host-published endpoint.
-            cluster["endpoint"] = f"https://{_MINISTACK_HOST}:{cluster['_port']}"
+            cluster["endpoint"] = _cluster_endpoint(cluster["_port"])
             _mark_idp_active()
 
     threading.Thread(target=_bg_restart, daemon=True, name=f"eks-restart-{cluster_name}").start()
@@ -1454,6 +1543,281 @@ def _list_tags(arn):
 
 
 # ---------------------------------------------------------------------------
+# AWS IAM authenticator compatible TokenReview webhook
+# ---------------------------------------------------------------------------
+
+_EKS_TOKEN_PREFIX = "k8s-aws-v1."
+_EKS_TOKEN_VALIDITY_SECONDS = 15 * 60
+
+
+def _token_review_response(review, *, authenticated=False, username="", uid="", groups=None,
+                           audiences=None):
+    status = {"authenticated": authenticated}
+    if authenticated:
+        status["user"] = {
+            "username": username,
+            "uid": uid,
+            "groups": groups or [],
+        }
+        if audiences:
+            status["audiences"] = audiences
+    return _json_resp(200, {
+        "apiVersion": review.get("apiVersion", "authentication.k8s.io/v1"),
+        "kind": "TokenReview",
+        "status": status,
+    })
+
+
+def _decode_aws_iam_token(token):
+    if not isinstance(token, str) or len(token) > 16384 or not token.startswith(_EKS_TOKEN_PREFIX):
+        return None
+    encoded = token[len(_EKS_TOKEN_PREFIX):]
+    try:
+        encoded += "=" * (-len(encoded) % 4)
+        raw = base64.urlsafe_b64decode(encoded.encode("ascii"))
+        url = raw.decode("utf-8")
+        parsed = urllib.parse.urlsplit(url)
+    except (ValueError, UnicodeDecodeError, UnicodeEncodeError):
+        return None
+    if parsed.scheme != "https" or not parsed.netloc or parsed.path not in ("", "/"):
+        return None
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    if any(len(values) != 1 for values in query.values()):
+        return None
+    return parsed, query
+
+
+def _qp(query, name):
+    values = query.get(name) or query.get(name.lower())
+    if isinstance(values, (list, tuple)):
+        return values[0] if values else ""
+    return values or ""
+
+
+def _verify_eks_token(token, cluster_name):
+    """Verify an AWS CLI EKS exec token without calling the real STS service.
+
+    ``aws eks get-token`` signs a GET to regional STS with the cluster name in
+    the ``x-k8s-aws-id`` signed header. The URL's advertised 60-second
+    presign lifetime is intentionally not used here: kubectl caches the
+    resulting ExecCredential for roughly 14 minutes and the upstream
+    authenticator accepts a 15-minute token window.
+    """
+    decoded = _decode_aws_iam_token(token)
+    if not decoded:
+        return None
+    parsed, query = decoded
+    if (
+        _qp(query, "X-Amz-Algorithm") != "AWS4-HMAC-SHA256"
+        or _qp(query, "Action") != "GetCallerIdentity"
+        or _qp(query, "Version") != "2011-06-15"
+    ):
+        return None
+    credential_scope = _qp(query, "X-Amz-Credential").split("/")
+    amz_date = _qp(query, "X-Amz-Date")
+    signed_headers = _qp(query, "X-Amz-SignedHeaders").lower()
+    signature = _qp(query, "X-Amz-Signature")
+    if (
+        len(credential_scope) != 5
+        or not credential_scope[0]
+        or not amz_date
+        or not re.fullmatch(r"[0-9a-f]{64}", signature)
+        or credential_scope[3] != "sts"
+        or credential_scope[4] != "aws4_request"
+        or "host" not in signed_headers.split(";")
+        or "x-k8s-aws-id" not in signed_headers.split(";")
+    ):
+        return None
+
+    host = parsed.netloc
+    hostname = parsed.hostname or ""
+    if not re.fullmatch(r"sts(?:[.-][a-z0-9-]+)?\.amazonaws\.com", hostname):
+        return None
+    if hostname != f"sts.{credential_scope[2]}.amazonaws.com":
+        return None
+    try:
+        if not 0 <= int(_qp(query, "X-Amz-Expires")) <= _EKS_TOKEN_VALIDITY_SECONDS:
+            return None
+        signed_at = dt.datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return None
+    age = (dt.datetime.now(dt.timezone.utc) - signed_at).total_seconds()
+    if age < -300 or age > _EKS_TOKEN_VALIDITY_SECONDS or credential_scope[1] != amz_date[:8]:
+        return None
+
+    # The cluster ID is not present in the presigned query string. It is the
+    # value of a signed header on the original STS request, so inject the
+    # cluster being authenticated before rebuilding the canonical request.
+    signed_request_headers = {
+        "host": host,
+        "x-k8s-aws-id": cluster_name,
+    }
+    canonical_request = build_canonical_request(
+        "GET",
+        parsed.path or "/",
+        signed_request_headers,
+        query,
+        signed_headers,
+        # botocore's STS presigner signs an empty GET payload. Accepting only
+        # this hash also keeps the verifier compatible with the authenticator.
+        payload_hash="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    )
+    string_to_sign = build_string_to_sign(
+        amz_date,
+        credential_scope[1],
+        credential_scope[2],
+        credential_scope[3],
+        canonical_request,
+    )
+    access_key_id = credential_scope[0]
+    try:
+        account_id = find_iam_access_key_account(access_key_id)
+    except AmbiguousAccessKeyError:
+        return None
+    # TokenReview calls have no AWS Authorization header. Resolve every kind
+    # of key independently of the gateway request's account context.
+    account_id = account_id or _account_from_sts_session(access_key_id)
+    if re.fullmatch(r"\d{12}", access_key_id):
+        account_id = access_key_id
+    credential = resolve_credential(
+        access_key_id,
+        account_id or os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000"),
+        _qp(query, "X-Amz-Security-Token") or None,
+    )
+    if isinstance(credential, CredentialResolutionError):
+        return None
+    expected = calculate_signature(
+        credential.secret_access_key,
+        credential_scope[1],
+        credential_scope[2],
+        credential_scope[3],
+        string_to_sign,
+    )
+    if not signatures_match(expected, signature):
+        return None
+    return credential
+
+
+def _cluster_for_auth(cluster_name, account_id=None, region=None):
+    """Find a cluster across scoped stores without leaking tenant state."""
+    matches = [
+        (account, cluster_region, cluster)
+        for (account, cluster_region, name), cluster in _clusters.all_items()
+        if name == cluster_name
+        and (account_id is None or account == account_id)
+        and (region is None or cluster_region == region)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _role_arn_from_assumed_role(arn):
+    match = re.fullmatch(r"arn:([^:]+):sts::([^:]+):assumed-role/([^/]+)/[^/]+", arn or "")
+    if not match:
+        return ""
+    partition, account, role = match.groups()
+    # STS session ARNs omit the IAM role's path. Recover it from IAM so that
+    # access entries for role/team/developer match assumed-role/developer/...
+    from ministack.services import iam
+    record = iam._roles.get_scoped(account, None, role)
+    if record:
+        return record.get("Arn", "")
+    return f"arn:{partition}:iam::{account}:role/{role}"
+
+
+def _access_entry_for_principal(cluster_name, account_id, region, principal_arn):
+    candidates = [principal_arn]
+    role_arn = _role_arn_from_assumed_role(principal_arn)
+    if role_arn:
+        candidates.append(role_arn)
+    for candidate in candidates:
+        entry = _access_entries.get_scoped(
+            account_id, region, _ae_key(cluster_name, candidate)
+        )
+        if entry:
+            return entry
+    return None
+
+
+def _authenticate_token_review(cluster_name, account_id, region, review):
+    from ministack.app import AUTH
+
+    spec = review.get("spec")
+    if not isinstance(spec, dict) or not isinstance(spec.get("token"), str) or not spec["token"]:
+        return _token_review_response(review)
+
+    cluster_info = _cluster_for_auth(cluster_name, account_id, region)
+    if not cluster_info:
+        return _token_review_response(review)
+    account_id, region, cluster = cluster_info
+
+    # Permissive mode accepts local bearer credentials without requiring an
+    # IAM identity, a matching secret, or an access entry, just like the AWS
+    # control plane skips IAM enforcement when AUTH=false.
+    if not AUTH:
+        return _token_review_response(
+            review, authenticated=True, username="ministack-local", uid="ministack-local",
+            groups=["system:authenticated", "system:masters"],
+        )
+
+    credential = _verify_eks_token(spec["token"], cluster_name)
+    if not credential:
+        return _token_review_response(review)
+
+    # IAM authorizes AWS EKS API operations at the gateway. Kubernetes access
+    # additionally requires the bootstrap creator grant or an access entry;
+    # an IAM Allow for eks:* alone does not confer Kubernetes permissions.
+    entry = _access_entry_for_principal(
+        cluster_name, account_id, region, credential.principal_arn
+    )
+    username = credential.principal_arn
+    groups = ["system:authenticated"]
+    if entry:
+        username = entry.get("username") or username
+        groups.extend(entry.get("kubernetesGroups") or [])
+        # These managed policies are understood by EKS's authorizer. k3s only
+        # has RBAC, so grant the equivalent local administrator group.
+        policy_prefix = f"{cluster_name}\x00{entry['principalArn']}\x00"
+        if any(
+            key[:2] == (account_id, region)
+            and str(key[2]).startswith(policy_prefix)
+            and policy.get("policyArn") == "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+            and policy.get("accessScope", {}).get("type") == "cluster"
+            for key, policy in _access_policies.all_items()
+        ):
+            groups.append("system:masters")
+    elif (
+        credential.account_id == account_id
+        and cluster.get("accessConfig", {}).get("bootstrapClusterCreatorAdminPermissions", True)
+        and cluster.get("_creator_arn") == (
+            _role_arn_from_assumed_role(credential.principal_arn) or credential.principal_arn
+        )
+    ):
+        groups.append("system:masters")
+    else:
+        return _token_review_response(review)
+
+    # Deduplicate while preserving the caller's configured order.
+    groups = list(dict.fromkeys(groups))
+    return _token_review_response(
+        review,
+        authenticated=True,
+        username=username,
+        uid=credential.principal_id or credential.principal_arn,
+        groups=groups,
+    )
+
+
+def _handle_auth_webhook(cluster_name, account_id, region, body_bytes):
+    try:
+        review = json.loads(body_bytes) if body_bytes else {}
+    except (TypeError, json.JSONDecodeError):
+        review = {}
+    if not isinstance(review, dict):
+        review = {}
+    return _authenticate_token_review(cluster_name, account_id, region, review)
+
+
+# ---------------------------------------------------------------------------
 # Sanitize (remove internal fields)
 # ---------------------------------------------------------------------------
 
@@ -1466,6 +1830,20 @@ def _sanitize(cluster):
 # ---------------------------------------------------------------------------
 
 def _handle_request_sync(method, path, headers, body_bytes, query_params):
+    # This private route is called by the k3s apiserver's authentication
+    # webhook, not by an AWS EKS client. Keep it outside the EKS JSON API
+    # namespace so the normal AWS action router never sees TokenReview data.
+    auth_match = re.fullmatch(
+        r"/eks-auth/(\d{12})/([A-Za-z0-9-]+)/([A-Za-z0-9_.-]+)", path
+    )
+    if auth_match and method == "POST":
+        return _handle_auth_webhook(
+            urllib.parse.unquote(auth_match.group(3)),
+            auth_match.group(1),
+            auth_match.group(2),
+            body_bytes,
+        )
+
     try:
         body = json.loads(body_bytes) if body_bytes else {}
     except json.JSONDecodeError:
@@ -1475,7 +1853,9 @@ def _handle_request_sync(method, path, headers, body_bytes, query_params):
 
     # POST /clusters
     if path == "/clusters" and method == "POST":
-        return _create_cluster(body)
+        identity = resolve_caller_identity(extract_access_key_id(headers, query_params))
+        creator_arn = identity["userArn"] if identity else None
+        return _create_cluster(body, _role_arn_from_assumed_role(creator_arn) or creator_arn)
 
     # GET /clusters
     if path == "/clusters" and method == "GET":
