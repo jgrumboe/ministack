@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **EKS — AWS CLI kubeconfig authentication** — k3s accepts `aws eks get-token` credentials through a MiniStack TokenReview webhook, so `aws eks update-kubeconfig` works without copying a container's admin kubeconfig. `AUTH=false` permits local bearer tokens; `AUTH=true` validates IAM credentials and requires creator or Access Entry grants, including account-scoped STS sessions. Fixes #1140.
+
 ## [1.5.11] — 2026-09-13
 
 ### Added
