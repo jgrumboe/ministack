@@ -1118,9 +1118,22 @@ the principal that creates the cluster gets bootstrap administrator access unles
 `--access-config bootstrapClusterCreatorAdminPermissions=false` is supplied.
 The cluster's service role does not inherit that access. Other principals need
 an EKS Access Entry with `kubernetesGroups` bound through Kubernetes RBAC, or
-the exact `AmazonEKSClusterAdminPolicy` with cluster scope.
-Namespace-scoped and other managed access policies currently round-trip through
-the API but do not grant Kubernetes permissions; use RBAC groups for those cases.
+one of these EKS managed access policies:
+
+| Policy | Kubernetes permissions |
+|---|---|
+| `AmazonEKSClusterAdminPolicy` | Full cluster administration |
+| `AmazonEKSAdminPolicy` | Broad administration, including namespace Roles and RoleBindings |
+| `AmazonEKSEditPolicy` | Modify workloads and Secrets, but not RBAC administration |
+| `AmazonEKSViewPolicy` | Read workloads, excluding Secrets |
+| `AmazonEKSAdminViewPolicy` | Read all resources, including Secrets |
+
+Policies can use cluster or namespace scope. Namespace entries accept wildcard
+patterns such as `dev-*`; MiniStack reconciles their RBAC bindings when a
+matching namespace is created, and after association updates or deletions.
+EKS normally evaluates these policies in its control-plane authorizer. k3s has
+only Kubernetes RBAC, so MiniStack materializes equivalent, managed RBAC roles
+and bindings internally. User-supplied `kubernetesGroups` remain additive.
 Existing clusters without a recorded creator also need an explicit Access Entry.
 
 With `AUTH=false`, neither IAM policies nor Access Entries restrict Kubernetes

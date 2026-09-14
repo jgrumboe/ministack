@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **EKS — managed Access Policy authorization in k3s** — `AmazonEKSClusterAdminPolicy`, `AmazonEKSAdminPolicy`, `AmazonEKSEditPolicy`, `AmazonEKSViewPolicy`, and `AmazonEKSAdminViewPolicy` now grant their published Kubernetes permissions under `AUTH=true`. Cluster and namespace scopes, including namespace wildcard patterns, are reconciled to managed k3s RBAC bindings after policy changes and when matching namespaces appear; disassociating a policy or deleting its Access Entry revokes the bindings.
+
 ### Fixed
 - **EKS — AWS CLI kubeconfig authentication** — k3s accepts `aws eks get-token` credentials through a MiniStack TokenReview webhook, so `aws eks update-kubeconfig` works without copying a container's admin kubeconfig. `AUTH=false` permits local bearer tokens; `AUTH=true` validates IAM credentials and requires creator or Access Entry grants, including account-scoped STS sessions. Fixes #1140.
 
