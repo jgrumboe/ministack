@@ -1398,7 +1398,8 @@ _AUTH_CLUSTER = "auth-cluster"
 _AUTH_USER_KEY = "AKIAEKSREVIEW"
 _AUTH_USER_ARN = f"arn:aws:iam::{_AUTH_ACCOUNT}:user/developer"
 _AUTH_ROLE_ARN = f"arn:aws:iam::{_AUTH_ACCOUNT}:role/control-plane"
-_AUTH_ADMIN_POLICY = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+_AUTH_POLICY_PREFIX = "arn:aws:eks::aws:cluster-access-policy/"
+_AUTH_ADMIN_POLICY = _AUTH_POLICY_PREFIX + "AmazonEKSClusterAdminPolicy"
 
 
 @pytest.fixture
@@ -1615,19 +1616,133 @@ def test_eks_auth_nondefault_sts_session_and_role_path_access_entry(eks_auth_env
     assert _auth_review(_auth_token(key, session="local-session"), _AUTH_OTHER_ACCOUNT)["authenticated"] is False
 
 
-@pytest.mark.parametrize("scope,policy,admin", [
+@pytest.mark.parametrize("scope,policy,supported", [
     ({"type": "cluster"}, _AUTH_ADMIN_POLICY, True),
-    ({"type": "namespace", "namespaces": ["dev"]}, _AUTH_ADMIN_POLICY, False),
-    ({"type": "cluster"}, "arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy", False),
+    ({"type": "namespace", "namespaces": ["dev"]}, _AUTH_ADMIN_POLICY, True),
+    ({"type": "cluster"}, _AUTH_POLICY_PREFIX + "AmazonEKSViewPolicy", True),
     ({"type": "cluster"}, "fake-AmazonEKSClusterAdminPolicy", False),
 ])
-def test_eks_auth_access_policy_never_broadens_namespace_or_unknown_permissions(eks_auth_env, scope, policy, admin):
+def test_eks_auth_access_policies_map_to_internal_rbac_groups(eks_auth_env, monkeypatch, scope, policy, supported):
+    monkeypatch.setattr(eks_service, "_schedule_access_policy_reconcile", lambda *args: None)
     _auth_cluster()
     eks_service._create_access_entry(_AUTH_CLUSTER, {"principalArn": _AUTH_USER_ARN})
     eks_service._associate_access_policy(_AUTH_CLUSTER, _AUTH_USER_ARN, {"policyArn": policy, "accessScope": scope})
     result = _auth_review(_auth_token(_AUTH_USER_KEY))
     assert result["authenticated"] is True
-    assert ("system:masters" in result["user"]["groups"]) is admin
+    group = eks_service._access_policy_group(_AUTH_CLUSTER, _AUTH_USER_ARN, policy)
+    assert (group in result["user"]["groups"]) is supported
+    assert "system:masters" not in result["user"]["groups"]
+
+
+def _policy_allows(policy_name, verb, api_group, resource):
+    for rule in eks_service._ACCESS_POLICY_RULES[policy_name]:
+        groups = rule.get("apiGroups", [])
+        resources = rule.get("resources", [])
+        verbs = rule["verbs"]
+        if (
+            (api_group in groups or "*" in groups)
+            and (resource in resources or "*" in resources)
+            and (verb in verbs or "*" in verbs)
+        ):
+            return True
+    return False
+
+
+@pytest.mark.parametrize("policy,allowed,denied", [
+    ("AmazonEKSClusterAdminPolicy", ("delete", "rbac.authorization.k8s.io", "clusterroles"), ()),
+    ("AmazonEKSAdminPolicy", ("create", "rbac.authorization.k8s.io", "rolebindings"), ("delete", "", "nodes")),
+    ("AmazonEKSEditPolicy", ("create", "", "secrets"), ("create", "rbac.authorization.k8s.io", "roles")),
+    ("AmazonEKSViewPolicy", ("get", "", "pods"), ("get", "", "secrets")),
+    ("AmazonEKSAdminViewPolicy", ("get", "", "secrets"), ("create", "", "secrets")),
+])
+def test_eks_access_policy_rules_allow_and_deny_documented_operations(policy, allowed, denied):
+    assert _policy_allows(policy, *allowed)
+    if denied:
+        assert not _policy_allows(policy, *denied)
+
+
+def test_eks_access_policy_rbac_reconciles_scopes_namespaces_and_revocation(eks_auth_env, monkeypatch):
+    """The materialized k3s RBAC follows association updates and new matches."""
+    monkeypatch.setattr(eks_service, "_schedule_access_policy_reconcile", lambda *args: None)
+    _auth_cluster()
+    eks_service._clusters.get_scoped(_AUTH_ACCOUNT, _AUTH_REGION, _AUTH_CLUSTER)["_docker_id"] = "k3s"
+    policy = _AUTH_POLICY_PREFIX + "AmazonEKSViewPolicy"
+    with request_scope(_AUTH_ACCOUNT, _AUTH_REGION):
+        eks_service._create_access_entry(_AUTH_CLUSTER, {"principalArn": _AUTH_USER_ARN})
+        eks_service._associate_access_policy(_AUTH_CLUSTER, _AUTH_USER_ARN, {
+            "policyArn": policy,
+            "accessScope": {"type": "namespace", "namespaces": ["dev-*"]},
+        })
+
+    namespaces = ["default", "dev-api", "prod"]
+    captured = []
+    managed = {"ClusterRoleBinding": [], "RoleBinding": []}
+    deletes = []
+    container = SimpleNamespace()
+    client = SimpleNamespace(containers=SimpleNamespace(get=lambda _id: container))
+
+    def kubectl(_container, command):
+        if command[1:3] == ["get", "namespaces"]:
+            return 0, json.dumps({"items": [{"metadata": {"name": name}} for name in namespaces]})
+        if "delete" in command:
+            deletes.append(command)
+        return 0, ""
+
+    monkeypatch.setattr(eks_service, "_get_docker", lambda: client)
+    monkeypatch.setattr(eks_service, "_k3s_exec", kubectl)
+    monkeypatch.setattr(
+        eks_service, "_apply_access_policy_rbac",
+        lambda _container, objects: captured.append(objects),
+    )
+    monkeypatch.setattr(
+        eks_service, "_managed_access_policy_bindings",
+        lambda _container, kind: managed[kind],
+    )
+
+    assert eks_service._reconcile_access_policy_rbac(_AUTH_CLUSTER, _AUTH_ACCOUNT, _AUTH_REGION)
+    bindings = [obj for obj in captured[-1] if obj["kind"] == "RoleBinding"]
+    assert [binding["metadata"]["namespace"] for binding in bindings] == ["dev-api"]
+    assert bindings[0]["roleRef"]["name"] == "ministack-eks-amazoneksviewpolicy"
+    managed["RoleBinding"] = bindings
+
+    namespaces.append("dev-worker")
+    assert eks_service._reconcile_access_policy_rbac(_AUTH_CLUSTER, _AUTH_ACCOUNT, _AUTH_REGION)
+    bindings = [obj for obj in captured[-1] if obj["kind"] == "RoleBinding"]
+    assert {binding["metadata"]["namespace"] for binding in bindings} == {"dev-api", "dev-worker"}
+
+    with request_scope(_AUTH_ACCOUNT, _AUTH_REGION):
+        eks_service._associate_access_policy(_AUTH_CLUSTER, _AUTH_USER_ARN, {
+            "policyArn": policy, "accessScope": {"type": "cluster"},
+        })
+    managed["RoleBinding"] = bindings
+    assert eks_service._reconcile_access_policy_rbac(_AUTH_CLUSTER, _AUTH_ACCOUNT, _AUTH_REGION)
+    cluster_bindings = [obj for obj in captured[-1] if obj["kind"] == "ClusterRoleBinding"]
+    assert len(cluster_bindings) == 1
+    assert {command[2] for command in deletes} == {"rolebinding"}
+
+    managed["ClusterRoleBinding"] = cluster_bindings
+    with request_scope(_AUTH_ACCOUNT, _AUTH_REGION):
+        eks_service._disassociate_access_policy(_AUTH_CLUSTER, _AUTH_USER_ARN, policy)
+    assert eks_service._reconcile_access_policy_rbac(_AUTH_CLUSTER, _AUTH_ACCOUNT, _AUTH_REGION)
+    assert not [obj for obj in captured[-1] if obj["kind"].endswith("Binding")]
+    assert {command[2] for command in deletes} == {"rolebinding", "clusterrolebinding"}
+
+
+def test_eks_access_policy_changes_schedule_rbac_reconciliation(eks_auth_env, monkeypatch):
+    scheduled = []
+    policy = _AUTH_POLICY_PREFIX + "AmazonEKSEditPolicy"
+    monkeypatch.setattr(
+        eks_service, "_schedule_access_policy_reconcile",
+        lambda cluster_name, *args: scheduled.append(cluster_name),
+    )
+    _auth_cluster()
+    eks_service._create_access_entry(_AUTH_CLUSTER, {"principalArn": _AUTH_USER_ARN})
+    eks_service._associate_access_policy(_AUTH_CLUSTER, _AUTH_USER_ARN, {
+        "policyArn": policy, "accessScope": {"type": "cluster"},
+    })
+    eks_service._disassociate_access_policy(_AUTH_CLUSTER, _AUTH_USER_ARN, policy)
+    eks_service._delete_access_entry(_AUTH_CLUSTER, _AUTH_USER_ARN)
+    assert scheduled == [_AUTH_CLUSTER, _AUTH_CLUSTER, _AUTH_CLUSTER]
 
 
 @pytest.mark.parametrize("minutes,accepted", [(2, True), (14, True), (16, False), (-6, False)])
